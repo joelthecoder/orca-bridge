@@ -1,0 +1,4 @@
+/target
+
+/integrations/raycast/node_modules/
+/integrations/raycast/raycast-env.d.ts

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "orca-bridge",
+  "title": "Orca Bridge",
+  "description": "Search local Orca history and open exact sessions",
+  "icon": "icon.png",
+  "author": "joelthecoder",
+  "categories": [
+    "Developer Tools"
+  ],
+  "commands": [
+    {
+      "name": "search",
+      "title": "Search Orca Sessions",
+      "description": "Search titles, paths, branches, agents and models",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "binary",
+      "type": "textfield",
+      "required": false,
+      "title": "Orca Bridge CLI",
+      "description": "Absolute CLI path; defaults to ~/.local/bin/orca-bridge"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.104.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "lint": "tsc --noEmit"
+  }
+}

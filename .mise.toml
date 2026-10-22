@@ -1,0 +1,8 @@
+[tools]
+rust = "1.99.1"
+
+[tasks.build]
+run = "make build"
+
+[tasks.check]
+run = "make check"
