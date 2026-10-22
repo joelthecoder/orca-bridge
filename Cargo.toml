@@ -1,0 +1,36 @@
+[package]
+name = "orca-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, scriptable access to Orca sessions, terminals, and activity"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/joelthecoder/orca-bridge"
+readme = "README.md"
+keywords = ["orca", "cli", "agents", "search", "jsonl"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+nucleo-matcher = "0.3.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+ctrlc = "3"
+url = "2"
+base64 = "0.22"
+crypto_box = { version = "0.9.1", features = ["std"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+png = "0.18"
+schemars = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
