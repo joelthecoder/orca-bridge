@@ -32,6 +32,13 @@ starts a new terminal for that historical conversation.
 
 ## Contracts
 
+The capability-gated organization commands are `terminals move HANDLE --worktree
+SELECTOR` and `sessions names preview --stdin`, `apply PLAN_ID`, `undo CHANGE_ID`.
+They delegate whole-tab movement and guarded naming to the native execution host;
+they never write Orca's databases. Stock Orca 1.4.242 lacks their advertised
+capabilities and is refused before mutation. See
+[session organization](session-organization.md) for selection and replay contracts.
+
 - Use `--json` for one JSON result, `--jsonl` for individual list rows. Pipes default
   to JSON; streams always emit JSONL and flush every record. Colors never enter JSON.
 - stdout is data; diagnostics are on stderr. Exit 0 is success or a downstream broken

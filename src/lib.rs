@@ -6,6 +6,7 @@ pub mod identity;
 pub mod model;
 pub mod projects;
 pub mod rpc;
+pub mod session_organization;
 pub mod skills;
 pub mod stream;
 pub mod terminal;

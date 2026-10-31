@@ -54,6 +54,26 @@ or `terminals stop HANDLE` targets an exact PTY and preserves history. `terminal
 HANDLE --tab` removes the selected tab. Choose the authorized target explicitly; never
 clean up a user's other sessions merely because they look idle.
 
+## Selected organization controls
+
+`terminals move HANDLE --worktree SELECTOR` requests a same-host whole-tab transfer,
+including all split panes, through the native owner. It requires
+`terminal.tab-transfer.v1`; stock Orca 1.4.242 does not advertise it. Never simulate
+the operation with a close, relaunch, resume, `cd`, or direct database write.
+An ambiguous reply names a request ID; inspect state and reuse `--request-id ID`.
+
+`sessions names preview --stdin` accepts an explicit JSON array of
+`{session,title,replaceManual?}` (at most 100 unique durable session IDs).
+Inspect the native preview, then use `sessions names apply PLAN_ID`.
+`sessions names undo CHANGE_ID` requests conflict-aware undo. These require
+`session.names.v1`, not yet advertised by stock Orca 1.4.242. Native receipts own
+conflicts; transport success does not establish that every name changed. Manual
+names are preserved unless replacement was explicitly requested for that row.
+These controls never write the Bridge's separate display-alias store.
+
+Keep task names stable and display native status separately. Idle/end-of-turn is
+never verified completion; missing/stale evidence remains unknown.
+
 ## Automations and projects
 
 Use `automations list|show|create|edit|run|runs|remove` for Orca's own automation system.

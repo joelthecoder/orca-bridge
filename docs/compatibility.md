@@ -23,6 +23,12 @@ credential exists; it is not an online health check.
 
 ## Current limits
 
+- Whole-tab move and selected-session naming clients require
+  `terminal.tab-transfer.v1` and `session.names.v1`. Stock Orca 1.4.242 advertises
+  neither; refusal is tested before mutation. Native transfer, naming transaction,
+  and disposable-terminal acceptance are not yet implemented or verified. See
+  [session organization](session-organization.md).
+
 - Internal Orca schemas are version-coupled. There is no broad version compatibility
   promise; unsupported schemas fail with diagnostics. Stronger upgrade fencing remains work.
 - Some provider identities and statuses remain unknown. Unknown status does not mean idle.

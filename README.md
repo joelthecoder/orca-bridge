@@ -132,6 +132,19 @@ available as `terminals rename HANDLE TITLE`; its result distinguishes acknowled
 from read-back verification. Orca 1.4.225 can acknowledge a rename while its title
 snapshots remain stale.
 
+Capability-gated session organization controls are also available:
+
+```sh
+orca-bridge terminals move HANDLE --worktree path:/absolute/destination --json
+orca-bridge sessions names preview --stdin < selection.json
+orca-bridge sessions names apply NATIVE_PLAN_ID --json
+orca-bridge sessions names undo NATIVE_CHANGE_ID --json
+```
+
+These require native transfer/naming capabilities, which stock Orca 1.4.242 does
+not advertise. Unsupported hosts are refused before mutation. See the
+[operator contract and current verification boundary](docs/session-organization.md).
+
 Prompt text is passed literally. Agent approval and sandbox settings come from Orca
 and the user's configuration. Optional `--model`, `--effort` and `--focus` select the
 launch behavior. Historical usage is bounded and provider-dependent; missing or partial
