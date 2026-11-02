@@ -82,6 +82,7 @@ orca-bridge sessions show ID --usage --json
 orca-bridge open ID
 orca-bridge sessions resume ID
 orca-bridge sessions link ID
+orca-bridge sessions link ID --terminal --human  # Clickable live handle in Orca terminals
 ```
 
 `open` focuses a live conversation only when its provider identity is proven. If it

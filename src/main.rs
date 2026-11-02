@@ -215,6 +215,9 @@ enum SessionCommand {
     Link {
         /// Durable item ID; session commands also accept unique session prefixes
         id: String,
+        /// Resolve the live terminal handle that Orca makes clickable in terminal output
+        #[arg(long)]
+        terminal: bool,
     },
     /// Stream the source transcript without rewriting its records
     Transcript {
@@ -943,14 +946,23 @@ fn run_session(
         SessionCommand::Resume { id } => {
             actions::resume_session(config, &history::get_session(config, &id)?)?
         }
-        SessionCommand::Link { id } => {
+        SessionCommand::Link { id, terminal } => {
             let s = history::get_session(config, &id)?;
-            let link = actions::link(&s)?;
+            let value = if terminal {
+                actions::terminal_link(config, &s)?
+            } else {
+                json!({"id":s.id,"url":actions::link(&s)?})
+            };
             if matches!(format, Format::Text) {
-                writeln!(out, "{link}")?;
+                let target = if terminal { "terminal" } else { "url" };
+                writeln!(
+                    out,
+                    "{}",
+                    value[target].as_str().context("Missing link target")?
+                )?;
                 return Ok(());
             }
-            json!({"id":s.id,"url":link})
+            value
         }
         SessionCommand::Transcript {
             id,

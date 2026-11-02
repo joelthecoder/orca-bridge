@@ -33,6 +33,19 @@ A matching directory links location metadata; it never proves live ownership.
 Unknown ownership fails. `sessions resume ID` explicitly creates a new historical
 resume. Do not match titles or folder names to choose an agent to control.
 
+### Clickable targets in Orca terminals
+
+Use `sessions link ID --terminal --json` for a freshly proven native terminal target.
+Show the task name followed by the returned visible `term_…` handle. Orca makes that
+handle clickable (Cmd-click on macOS, Ctrl-click elsewhere). Do not hide it behind
+a Markdown label. Unknown or multiple live bindings fail; never guess from cwd/title.
+Handles expire across runtime changes, so reacquire them before reuse.
+
+`sessions link ID --json` still returns a durable `orca-bridge://session/…` URL for
+applications that support custom URL schemes. A registered OS handler does not make
+that URL clickable in Orca terminal output. When asked to go to the tab, use `open ID`
+and verify `action: focused` and `navigated: true` instead of returning another link.
+
 ```sh
 orca-bridge terminals list --json
 cat context.md | orca-bridge terminals send HANDLE --text - --enter

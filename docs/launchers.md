@@ -42,6 +42,27 @@ that the extension has been imported or used in Raycast.
 
 ## Clickable macOS links
 
+### Orca terminal output
+
+```sh
+orca-bridge sessions link ID --terminal --human
+orca-bridge sessions link ID --terminal --json
+```
+
+Orca recognizes visible `term_…` handles as native terminal links. Click for actions
+or Cmd-click on macOS (Ctrl-click elsewhere) to switch to that terminal. Show the
+task name beside the handle; do not hide it behind a Markdown label. The `--terminal`
+option requires exactly one proven live session binding and returns its incarnation
+and identity evidence in JSON. It does not focus, resume or create a session. Refresh
+the handle after a runtime restart; it is not a durable history link.
+
+A registered URL handler does not make custom protocols clickable in Orca terminal
+output. The terminal's URL handlers support HTTP and file links, so a Markdown
+`orca-bridge://…` target is not a working terminal destination.
+Use the native handle here. Other applications can use the durable URL below.
+
+### Applications that support custom URL schemes
+
 ```sh
 make url-install
 orca-bridge sessions link ID --json

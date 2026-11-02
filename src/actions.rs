@@ -166,6 +166,12 @@ pub fn resume_session(config: &Config, session: &Session) -> Result<Value> {
 pub fn link(session: &Session) -> Result<String> {
     session_link(&session.id)
 }
+
+pub fn terminal_link(config: &Config, session: &Session) -> Result<Value> {
+    let live = single_live(config, session)?;
+    Ok(json!({"id":session.id,"url":link(session)?,"terminal":live.terminal,"identity":live}))
+}
+
 fn session_link(id: &str) -> Result<String> {
     let mut url = Url::parse("orca-bridge://session/")?;
     url.path_segments_mut()

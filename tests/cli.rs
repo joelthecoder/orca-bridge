@@ -376,6 +376,72 @@ impl Fixture {
 }
 
 #[test]
+fn session_terminal_link_uses_only_the_proven_live_session() {
+    let fixture = Fixture::new();
+    let server = fixture.rpc_server(4, |_, request| match request["method"].as_str() {
+        Some("terminal.list") => {
+            assert_eq!(request["params"]["requireFreshPtyLiveness"], true);
+            json!({"terminals":[
+                {"handle":"term_alpha","incarnationId":"inc-alpha","agentIdentity":"codex","connected":true},
+                {"handle":"term_gamma","incarnationId":"inc-gamma","agentIdentity":"codex","connected":true}
+            ]})
+        }
+        Some("session.tabs.listAll") => json!({"snapshots":[{"tabs":[
+            {"type":"terminal","terminal":"term_alpha","incarnationId":"inc-alpha","agentStatus":{"agentType":"codex","providerSession":{"id":"alpha"}}},
+            {"type":"terminal","terminal":"term_gamma","incarnationId":"inc-gamma","agentStatus":{"agentType":"codex","providerSession":{"id":"gamma"}}}
+        ]}]}),
+        other => panic!("Link resolution must not mutate the runtime: {other:?}"),
+    });
+    let result =
+        json_output(&fixture.run(&["sessions", "link", "alpha", "--terminal", "--json"], ""));
+    assert_eq!(result["id"], "local:codex:alpha");
+    assert_eq!(result["terminal"], "term_alpha");
+    assert_eq!(result["identity"]["incarnationId"], "inc-alpha");
+    assert_eq!(result["url"], "orca-bridge://session/local:codex:alpha");
+    let output = fixture.run(&["sessions", "link", "alpha", "--terminal", "--human"], "");
+    succeeded(&output);
+    assert_eq!(output.stdout, b"term_alpha\n");
+    server.join().unwrap();
+}
+
+#[test]
+fn session_terminal_link_refuses_missing_or_ambiguous_ownership() {
+    for count in [0, 2] {
+        let fixture = Fixture::new();
+        let server = fixture.rpc_server(2, move |_, request| {
+            match request["method"].as_str() {
+                Some("terminal.list") => json!({"terminals":(0..count).map(|i| json!({
+                    "handle":format!("term_{i}"),"incarnationId":format!("inc-{i}"),
+                    "agentIdentity":"codex","connected":true
+                })).collect::<Vec<_>>()}),
+                Some("session.tabs.listAll") => json!({"snapshots":[{"tabs":(0..count).map(|i| json!({
+                    "type":"terminal","terminal":format!("term_{i}"),"incarnationId":format!("inc-{i}"),
+                    "agentStatus":{"agentType":"codex","providerSession":{"id":"alpha"}}
+                })).collect::<Vec<_>>()}]}),
+                other => panic!("Link resolution must not mutate the runtime: {other:?}"),
+            }
+        });
+        let output = fixture.run(&["sessions", "link", "alpha", "--terminal", "--json"], "");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("exactly one proven live terminal")
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn durable_session_links_still_work_without_a_running_runtime() {
+    let fixture = Fixture::new();
+    let result = json_output(&fixture.run(&["sessions", "link", "alpha", "--json"], ""));
+    assert_eq!(
+        result,
+        json!({"id":"local:codex:alpha","url":"orca-bridge://session/local:codex:alpha"})
+    );
+}
+
+#[test]
 fn notification_epoch_is_omitted_until_known_then_forwarded() {
     let fixture = Fixture::new();
     let server=fixture.rpc_server(2,|index,request| {
