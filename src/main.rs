@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use orca_bridge::{
-    actions, config::Config, events, history, model::Session, projects, rpc::RpcClient, skills,
-    stream, terminal, ui,
+    actions, config::Config, events, history, model::Session, projects, rpc::RpcClient,
+    session_organization, skills, stream, terminal, ui,
 };
 use serde_json::{Value, json};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
@@ -180,6 +180,11 @@ struct Search {
 }
 #[derive(Subcommand)]
 enum SessionCommand {
+    /// Preview, apply, or undo selected task names through the native owner
+    Names {
+        #[command(subcommand)]
+        command: SessionNamesCommand,
+    },
     /// Rename the bridge display title; empty resets it. Provider history is preserved
     Rename {
         id: String,
@@ -277,6 +282,19 @@ enum SessionCommand {
         /// Request interrupt-style input when supported by Orca
         interrupt: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SessionNamesCommand {
+    /// Preview an explicit JSON array of {session,title,replaceManual?} on stdin
+    Preview {
+        #[arg(long, required = true)]
+        stdin: bool,
+    },
+    /// Apply an unchanged native preview; conflicts do not overwrite later edits
+    Apply { plan_id: String },
+    /// Undo a native naming change only where its applied versions still match
+    Undo { change_id: String },
 }
 #[derive(Args)]
 struct AutomationTarget {
@@ -457,6 +475,15 @@ enum WorktreeCommand {
 }
 #[derive(Subcommand)]
 enum TerminalCommand {
+    /// Transfer the entire live tab to a workspace on the same execution host
+    Move {
+        terminal: String,
+        #[arg(long)]
+        worktree: String,
+        /// Reuse the same ID after an unconfirmed reply; never retry as a new move
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// Set the live tab title, or pass an empty title to reset it
     Rename { terminal: String, title: String },
     /// Stop this exact live PTY, preserving recorded conversation history
@@ -921,6 +948,19 @@ fn run_session(
     out: &mut impl Write,
 ) -> Result<()> {
     let value = match command {
+        SessionCommand::Names { command } => match command {
+            SessionNamesCommand::Preview { stdin: _ } => {
+                let selections = serde_json::from_str(&literal("-".into())?)
+                    .context("Expected a JSON array of selected sessions and task titles")?;
+                session_organization::preview_names(config, selections)?
+            }
+            SessionNamesCommand::Apply { plan_id } => {
+                session_organization::apply_names(config, &plan_id)?
+            }
+            SessionNamesCommand::Undo { change_id } => {
+                session_organization::undo_names(config, &change_id)?
+            }
+        },
         SessionCommand::Rename { id, title } => {
             serde_json::to_value(history::rename(config, &id, &title)?)?
         }
@@ -1217,9 +1257,10 @@ fn command_effect(path: &[String]) -> &'static str {
         | ["projects", "settings", "set"]
         | ["projects", "icon", "apply"]
         | ["sessions", "open" | "resume" | "create" | "send" | "stop"]
+        | ["sessions", "names", "preview" | "apply" | "undo"]
         | [
             "terminals",
-            "focus" | "create" | "send" | "rename" | "stop" | "close",
+            "focus" | "create" | "send" | "rename" | "stop" | "close" | "move",
         ]
         | ["worktrees", "create"]
         | ["open"] => "runtime-write",
@@ -1471,6 +1512,22 @@ fn run() -> Result<()> {
         Command::Terminals { command } => {
             let mut args = vec!["terminal".into()];
             match command {
+                TerminalCommand::Move {
+                    terminal,
+                    worktree,
+                    request_id,
+                } => {
+                    return emit(
+                        &session_organization::transfer_tab(
+                            &config,
+                            &terminal,
+                            &worktree,
+                            &request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        )?,
+                        format,
+                        &mut out,
+                    );
+                }
                 TerminalCommand::Rename { terminal, title } => {
                     return emit(
                         &actions::rename_terminal(&config, &terminal, &title)?,

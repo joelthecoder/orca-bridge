@@ -181,16 +181,19 @@ fn cache_current(entry: &Value, path: &Path) -> bool {
 }
 
 pub fn get_session(config: &Config, id: &str) -> Result<Session> {
+    resolve_session(&load_sessions(config)?, id)
+}
+
+pub fn resolve_session(sessions: &[Session], id: &str) -> Result<Session> {
     if id.trim().is_empty() {
         bail!("Session ID must not be empty")
     }
-    let sessions = load_sessions(config)?;
     if let Some(session) = sessions.iter().find(|s| s.id == id) {
         return Ok(session.clone());
     }
     // Raw provider IDs are accepted only when unique across providers.
     let mut matches = sessions
-        .into_iter()
+        .iter()
         .filter(|s| s.id.starts_with(id) || s.session_id.starts_with(id));
     let Some(session) = matches.next() else {
         bail!("No session matches {id:?}")
@@ -198,7 +201,7 @@ pub fn get_session(config: &Config, id: &str) -> Result<Session> {
     if matches.next().is_some() {
         bail!("Ambiguous session {id:?}; use its complete durable ID")
     }
-    Ok(session)
+    Ok(session.clone())
 }
 
 fn timestamp(session: &Session) -> i64 {

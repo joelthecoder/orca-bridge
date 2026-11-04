@@ -442,6 +442,165 @@ fn durable_session_links_still_work_without_a_running_runtime() {
 }
 
 #[test]
+fn tab_move_refuses_an_old_host_before_showing_or_mutating_a_terminal() {
+    let fixture = Fixture::new();
+    let server = fixture.rpc_server(1, |_, request| {
+        assert_eq!(request["method"], "status.get");
+        json!({"capabilities": []})
+    });
+    let output = fixture.run(
+        &[
+            "terminals",
+            "move",
+            "term-selected",
+            "--worktree",
+            "path:/destination",
+        ],
+        "",
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("terminal.tab-transfer.v1"));
+    assert!(!fixture.state.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn tab_move_forwards_identity_fences_and_literal_destination_to_native_owner() {
+    let fixture = Fixture::new();
+    let server = fixture.rpc_server(3, |index, request| match index {
+        0 => {
+            assert_eq!(request["method"], "status.get");
+            json!({"capabilities": ["terminal.tab-transfer.v1"]})
+        }
+        1 => {
+            assert_eq!(request["method"], "terminal.show");
+            assert_eq!(request["params"], json!({"terminal": "term-selected"}));
+            json!({"terminal": {"incarnationId": "inc-selected", "worktreeId": "source"}})
+        }
+        _ => {
+            assert_eq!(request["method"], "terminal.transferTab");
+            assert_eq!(request["params"], json!({
+                "terminal": "term-selected", "destination": "path:/folder with spaces/$(literal)",
+                "expectedIncarnationId": "inc-selected", "expectedWorktreeId": "source", "requestId": "move-fixture"
+            }));
+            json!({"moved": true, "requestId": "move-fixture", "ptyId": "unchanged"})
+        }
+    });
+    let result = json_output(&fixture.run(
+        &[
+            "terminals",
+            "move",
+            "term-selected",
+            "--worktree",
+            "path:/folder with spaces/$(literal)",
+            "--request-id",
+            "move-fixture",
+        ],
+        "",
+    ));
+    assert_eq!(result["ptyId"], "unchanged");
+    assert!(!fixture.state.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn selected_naming_preview_uses_provider_identity_without_writing_labels() {
+    let fixture = Fixture::new();
+    let server = fixture.rpc_server(2, |index, request| {
+        if index == 0 {
+            assert_eq!(request["method"], "status.get");
+            return json!({"capabilities": ["session.names.v1"]});
+        }
+        assert_eq!(request["method"], "session.names.preview");
+        assert_eq!(
+            request["params"],
+            json!({"selection": [{
+                "session": {"agent": "codex", "sessionId": "alpha", "executionHostId": "local"},
+                "title": "Stable task", "replaceManual": false
+            }]})
+        );
+        json!({"planId": "native-plan", "items": [{"disposition": "preserve-manual"}]})
+    });
+    let result = json_output(&fixture.run(
+        &["sessions", "names", "preview", "--stdin"],
+        r#"[{"session":"local:codex:alpha","title":"Stable task"}]"#,
+    ));
+    assert_eq!(result["planId"], "native-plan");
+    assert!(!fixture.state.exists());
+    server.join().unwrap();
+}
+
+#[test]
+fn naming_apply_and_undo_preserve_native_conflict_receipts() {
+    for (command, field, id) in [
+        ("apply", "planId", "native-plan"),
+        ("undo", "changeId", "native-change"),
+    ] {
+        let fixture = Fixture::new();
+        let method = format!("session.names.{command}");
+        let server = fixture.rpc_server(2, move |index, request| {
+            if index == 0 {
+                return json!({"capabilities": ["session.names.v1"]});
+            }
+            assert_eq!(request["method"], method);
+            assert_eq!(request["params"], json!({field: id}));
+            json!({"applied": false, "conflicts": [{"reason": "title_changed"}]})
+        });
+        let result = json_output(&fixture.run(&["sessions", "names", command, id], ""));
+        assert_eq!(result["applied"], false);
+        assert_eq!(result["conflicts"][0]["reason"], "title_changed");
+        assert!(!fixture.state.exists());
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn naming_rejects_ambiguous_duplicate_and_unbounded_selections_before_rpc() {
+    let fixture = Fixture::new();
+    for selection in [
+        json!([]),
+        json!([{"session":"local:codex:alpha","title":"Stable","unexpected":true}]),
+        json!([{"session":"local:codex:alpha","title":"Stable"},{"session":"alpha","title":"Other"}]),
+        json!([{"session":"local:codex:alpha","title":"\u{001b}[2J"}]),
+        json!(vec![
+            json!({"session":"local:codex:alpha","title":"Stable"});
+            101
+        ]),
+    ] {
+        let output = fixture.run(
+            &["sessions", "names", "preview", "--stdin"],
+            &selection.to_string(),
+        );
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("runtime metadata"));
+        assert!(!fixture.state.exists());
+    }
+}
+
+#[test]
+fn organization_commands_publish_runtime_effects_and_require_explicit_targets() {
+    let fixture = Fixture::new();
+    for path in [
+        vec!["help", "terminals", "move", "--json"],
+        vec!["help", "sessions", "names", "preview", "--json"],
+        vec!["help", "sessions", "names", "apply", "--json"],
+        vec!["help", "sessions", "names", "undo", "--json"],
+    ] {
+        let result = json_output(&fixture.run(&path, ""));
+        assert_eq!(result["command"]["effect"], "runtime-write");
+    }
+    for args in [
+        vec!["terminals", "move", "term-selected"],
+        vec!["sessions", "names", "preview"],
+        vec!["sessions", "names", "apply"],
+        vec!["sessions", "names", "undo"],
+    ] {
+        let output = fixture.run(&args, "");
+        assert_eq!(output.status.code(), Some(2));
+    }
+}
+
+#[test]
 fn notification_epoch_is_omitted_until_known_then_forwarded() {
     let fixture = Fixture::new();
     let server=fixture.rpc_server(2,|index,request| {
