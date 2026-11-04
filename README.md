@@ -18,7 +18,9 @@ orca-bridge open local:codex:YOUR_SESSION_ID
 ```
 
 Metadata search reads Orca's local SQLite index directly. **No running app, pairing,
-server, or background collector is needed to search.** Measure query performance on your own machine with `make profile`. Keep benchmark output and local session counts outside Git. [How it works and performance](docs/architecture.md).
+server, or background collector is needed to search.** Measure query performance on
+your own machine with `make profile`. Keep benchmark output and local session counts
+outside Git. [How it works and performance](docs/architecture.md).
 
 | You want to… | Use Orca Bridge to… |
 | --- | --- |
