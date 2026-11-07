@@ -3,7 +3,7 @@ CARGO ?= $(MISE) cargo
 ARGS ?=
 INSTALL_DIR ?= $(HOME)/.local/bin
 .DEFAULT_GOAL := help
-.PHONY: help setup doctor all build format lint test check run install uninstall clean smoke smoke-native profile artwork alfred raycast url-install
+.PHONY: help setup doctor all build format lint test check run install uninstall clean smoke smoke-native smoke-resources profile completions artwork alfred raycast url-install
 
 ##@ Development
 help: ## Show available commands
@@ -34,11 +34,20 @@ smoke: build ## Exercise read-only commands against running Orca
 
 smoke-native: build ## Verify native snapshots and a disposable terminal create/remove event
 	python3 scripts/smoke-native.py target/release/orca-bridge --exercise
+smoke-resources: build ## Verify live memory/worktree inspection without stopping or deleting anything
+	python3 scripts/smoke-resources.py target/release/orca-bridge
 profile: build ## Measure process startup, history load and search ranking
 	$(CARGO) run --locked --release --example profile-search
 	python3 scripts/benchmark.py target/release/orca-bridge
 
 ##@ Launchers
+completions: build ## Generate Bash, Zsh, Fish, Elvish and PowerShell scripts under target/completions
+	mkdir -p target/completions
+	target/release/orca-bridge completions bash > target/completions/orca-bridge.bash
+	target/release/orca-bridge completions zsh > target/completions/_orca-bridge
+	target/release/orca-bridge completions fish > target/completions/orca-bridge.fish
+	target/release/orca-bridge completions elvish > target/completions/orca-bridge.elv
+	target/release/orca-bridge completions powershell > target/completions/orca-bridge.ps1
 artwork: ## Regenerate transparent README logos for light and dark themes
 	python3 scripts/build-readme-logo.py
 alfred: ## Package the importable Alfred workflow

@@ -44,7 +44,14 @@ credential exists; it is not an online health check.
   launches in an existing one. Worktree project filtering relies on the runtime's
   `projectId` field and is not verified across remote/project-host arrangements.
 - Transcript follow supports local JSONL and truncation. Provider databases and renamed
-  transcript files need provider-specific handling.
+  transcript files need provider-specific handling. `--last` reads a recent suffix
+  without parsing older records. Normalized `sessions messages` supports only local
+  Codex/Claude textual messages, with bounded source reads and explicit truncation.
+- Terminal read/follow accepts opaque string cursors from native responses. Tail
+  trimming is opt-in and preserves native metadata. Follow timeouts bound response
+  reads and polling sleeps. Orca 1.4.225 returns decimal string line cursors but
+  requires numeric RPC input; Bridge handles that conversion internally. New output
+  is not evidence of agent completion.
 - Recording defaults to 30-day/100,000-event retention, enforced each minute.
   Check `events status` replay bounds; a stale cursor needs a fresh snapshot.
   Uninstall preserves available history.
@@ -52,3 +59,18 @@ credential exists; it is not an online health check.
 
 Live credentials, runtime metadata, transcripts and private evidence never belong in
 Git. Live smoke commands are explicitly separate from deterministic `make check`.
+
+## 0.2.0 automation behavior
+
+- Runtime capability advertisements and installed CLI flags are reported separately
+  by `doctor`. A missing advertisement stays unknown; version strings are not proof.
+  Discovery never probes mutations or runs the memory sweep.
+- Native launch/prompt replay and submission observation are host-dependent. Older
+  hosts may expose legacy input only. Observation timeout never resends; uncertain
+  mutations require inspecting state and using the original native recovery ID.
+- Native CLI helpers have bounded deadlines/output. Those limits do not undo a
+  runtime action. `--json-errors` exposes stable codes and conservative certainty.
+- Worktree preview shares fresh execution checks but is not a concurrency lock.
+  Native acknowledgement and verified removal differ; incomplete read-back is unknown.
+- Repository/worktree scopes and compact JSON preserve coverage metadata. Shell
+  completions and schemas are generated offline from the current parser/contracts.

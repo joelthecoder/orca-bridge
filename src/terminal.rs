@@ -1,4 +1,5 @@
-//! Human terminal styling. Structured output never calls these renderers.
+//! Terminal response helpers and human styling. Structured output never calls styling renderers.
+use anyhow::{Context, Result, ensure};
 use clap::{
     ColorChoice,
     builder::{
@@ -6,13 +7,32 @@ use clap::{
         styling::{AnsiColor, Effects},
     },
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     io::IsTerminal,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 static COLOR: AtomicBool = AtomicBool::new(false);
+
+/// Retain the last native terminal tail rows without changing drafts or cursors.
+/// `truncated` reports only whether this already-returned tail was shortened.
+pub fn limit_tail(value: &mut Value, rows: usize) -> Result<()> {
+    ensure!(rows > 0, "Terminal tail row limit must be positive");
+    ensure!(
+        value.get("bridgeTail").is_none(),
+        "Unsupported terminal.read response: bridgeTail already exists"
+    );
+    let tail = value
+        .pointer_mut("/terminal/tail")
+        .and_then(Value::as_array_mut)
+        .context("Unsupported terminal.read response: expected terminal.tail array")?;
+    let removed = tail.len().saturating_sub(rows);
+    tail.drain(..removed);
+    let returned = tail.len();
+    value["bridgeTail"] = json!({"limit":rows,"returned":returned,"truncated":removed > 0});
+    Ok(())
+}
 
 pub fn styles() -> Styles {
     Styles::styled()
@@ -89,4 +109,59 @@ pub fn session(value: &Value) -> String {
         paint(field("cwd"), "2"),
         paint(field("id"), "2")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_limit_preserves_draft_cursors_envelope_and_unknown_fields() {
+        let mut value = json!({
+            "terminal":{
+                "handle":"term_fixture","draft":{"text":"unsent fixture","future":true},
+                "tail":[{"row":1},"second",{"row":3,"future":"preserved"}],
+                "cursor":42,"futureTerminal":{"kept":true}
+            },
+            "nextCursor":99,"runtimeId":"fixture","futureEnvelope":[1,2]
+        });
+        let mut expected = value.clone();
+        expected["terminal"]["tail"] = json!(["second",{"row":3,"future":"preserved"}]);
+        expected["bridgeTail"] = json!({"limit":2,"returned":2,"truncated":true});
+        limit_tail(&mut value, 2).unwrap();
+        assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn tail_limit_reports_short_and_empty_native_tails_without_inventing_truncation() {
+        for tail in [json!([]), json!(["fixture"])] {
+            let mut value = json!({"terminal":{"tail":tail}});
+            limit_tail(&mut value, 7).unwrap();
+            assert_eq!(value["terminal"]["tail"], tail);
+            assert_eq!(
+                value["bridgeTail"],
+                json!({"limit":7,"returned":tail.as_array().unwrap().len(),"truncated":false})
+            );
+        }
+    }
+
+    #[test]
+    fn tail_limit_rejects_unsupported_shapes_without_mutating_them() {
+        for source in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"terminal":{"tail":"fixture"}}),
+            json!({"tail":[1,2]}),
+            json!({"terminal":{"tail":[1,2]},"bridgeTail":{"future":"preserved"}}),
+        ] {
+            let mut value = source.clone();
+            assert!(limit_tail(&mut value, 1).is_err());
+            assert_eq!(value, source);
+        }
+        let mut value = json!({"terminal":{"tail":[1,2]}});
+        let original = value.clone();
+        assert!(limit_tail(&mut value, 0).is_err());
+        assert_eq!(value, original);
+    }
 }

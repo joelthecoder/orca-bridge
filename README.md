@@ -27,6 +27,7 @@ outside Git. [How it works and performance](docs/architecture.md).
 | Find a conversation you lost | Fuzzy-search titles, projects, branches, agents and models; search transcript content with `--full-text` |
 | Pick up where you left off | Open a proven live conversation, or explicitly resume a historical session |
 | See what needs you | Inspect live terminals, agent status, recent sessions and explicit attention |
+| Reclaim memory or worktree space | Inspect process-tree RSS/CPU, allocated disk estimates and Git changes, then explicitly stop a terminal or remove a stopped linked worktree |
 | Automate an agent | Create a session, send literal stdin, read terminal output and follow its transcript |
 | Build a launcher or dashboard | Consume JSON/JSONL, native push subscriptions, or a replayable local event journal |
 | Schedule recurring work | Create, inspect, edit and run Orca’s built-in automations |
@@ -55,8 +56,11 @@ orca-bridge --help                  # Human help; colors in a terminal
 orca-bridge search --help           # Options for a specific command
 orca-bridge help --json             # Complete machine-readable command tree
 orca-bridge help terminals send --json
+orca-bridge completions zsh         # Or bash, fish, elvish, powershell; no runtime access
 orca-bridge agent                   # Portable guide for agents and tool authors
 orca-bridge skill                   # Print the bundled assistant skill
+orca-bridge skills routing          # Directive cross-project handoff guide and template
+orca-bridge skills routing --json   # Guide plus machine-readable routing contract
 orca-bridge skill install --codex    # Or --claude; explicit, preserves existing skills
 ```
 
@@ -64,6 +68,11 @@ Help and the agent guide work without Orca, credentials, or even a configured da
 folder. Human output uses cyan commands and titles, amber accents and muted details.
 Use `--human` to keep that layout in a pipe, `--color always|never|auto` to control
 styling, or `NO_COLOR=1` to disable automatic colors. JSON is always unstyled.
+
+Generate completions into your shell's completion directory explicitly; Bridge does
+not edit shell startup files. For example, `orca-bridge completions zsh >
+~/.zfunc/_orca-bridge` after creating `~/.zfunc` and adding it to your Zsh `fpath`.
+`make completions` generates all supported scripts under `target/completions`.
 
 ## Find the conversation, then open it
 
@@ -87,6 +96,22 @@ orca-bridge sessions link ID
 orca-bridge sessions link ID --terminal --human  # Clickable live handle in Orca terminals
 ```
 
+Read recent conversation text without unpacking provider records:
+
+```sh
+orca-bridge sessions messages ID --limit 20 --json
+orca-bridge sessions messages ID --role assistant --limit 1 --json
+orca-bridge sessions transcript ID --last 20
+```
+
+`messages` supports local Codex and Claude text, omitting tools, thinking and non-text
+content. It inspects at most 2 MiB of source by default (`--max-bytes`, maximum 16 MiB)
+and reports source/limit truncation and an incomplete final record explicitly. Empty
+results can mean no matching text in that bounded source. `transcript --last N`
+returns the latest N raw nonblank JSONL records in source order and can combine with
+`--follow`; `--tail` still starts at EOF. Local metadata `--path` filters match a
+directory and its descendants, excluding similarly named neighboring directories.
+
 `open` focuses a live conversation only when its provider identity is proven. If it
 can prove the conversation is closed, it resumes history. If ownership is uncertain,
 it says so. `resume` explicitly asks for a new terminal. Titles and matching folders
@@ -100,6 +125,7 @@ a terminal handle identify different things; use the kind each command asks for.
 ```sh
 orca-bridge terminals list --json
 orca-bridge terminals read HANDLE --json
+orca-bridge terminals read HANDLE --tail 12 --json
 orca-bridge terminals follow HANDLE --timeout 30
 printf '%s' 'Summarize the changes and run the project checks.' \
   | orca-bridge terminals send HANDLE --text - --enter
@@ -119,6 +145,30 @@ Send a file or a diff as context with `cat context.md | orca-bridge sessions sen
 HANDLE --text - --enter` or `git diff | orca-bridge sessions send HANDLE --text - --enter`.
 Omit `--enter` to leave the input ready for review. These commands target terminal
 sessions; native Chat UI messages use a separate protocol.
+
+Observe prompt submission and recover a lost reply without sending a new request:
+
+```sh
+cat task.txt | orca-bridge terminals send HANDLE --text - --enter --wait-submit 30 --json
+# Only after an ambiguous failure supplies the original request ID:
+cat task.txt | orca-bridge terminals send HANDLE --text - --enter \
+  --wait-submit 30 --retry-request REQUEST_ID --json --json-errors
+```
+
+Both send aliases support these flags. `--wait-submit` observes the accepted prompt;
+its timeout returns the native receipt without resending. Replay requires the same
+payload and terminal incarnation. Acceptance, observed submission, turn start and
+task completion remain distinct. Older hosts may report legacy input without retry
+or observation support; inspect `doctor --json` and the returned receipt.
+
+`read --tail N` keeps the latest N native tail rows while retaining the draft, cursor
+and runtime metadata. Its `bridgeTail` field describes this additional trimming;
+Orca's own truncation fields remain authoritative for the upstream read. To wait
+for output after a previous read, pass its opaque `terminal.nextCursor` to
+`terminals follow HANDLE --cursor CURSOR --count 1 --timeout 30`. An unchanged cursor
+emits nothing. The timeout bounds runtime response waits and polling sleeps; it
+completes normally if no new output arrives. New output does not prove an agent
+finished its task.
 
 Rename or clean up selected sessions:
 
@@ -153,11 +203,123 @@ and the user's configuration. Optional `--model`, `--effort` and `--focus` selec
 launch behavior. Historical usage is bounded and provider-dependent; missing or partial
 counters stay explicitly unknown.
 
+## Inspect resources and clean up deliberately
+
+```sh
+orca-bridge resources --limit 20 --json
+orca-bridge resources --terminal HANDLE --json
+orca-bridge resources --repo name:project --sort cpu --limit 10 --json
+orca-bridge schema resources
+orca-bridge worktrees ps --json
+orca-bridge worktrees inventory --include-external --limit 200 --json
+orca-bridge worktrees usage --limit 20 --timeout 15 --json
+orca-bridge worktrees usage --worktree path:/absolute/project --json
+orca-bridge worktrees usage --repo name:project --json
+```
+
+`resources` reports Orca app memory, host available memory and each managed terminal
+process tree's resident memory and CPU. Rows sort by memory and include verified
+terminal handles/incarnations where available. Memory is RSS in bytes, not a promise
+of how much a stop will free. Historical `sessions usage` still reports token usage.
+Collect resource snapshots on demand; this is a host process sweep, not a heartbeat.
+
+Repository/worktree filters apply before terminal ranking and limits. `--sort`
+accepts `memory` or `cpu`. App, host and `orcaTotal` numbers stay global; `selection`
+identifies the scoped rows. Worktree disk inspection can be scoped by repository;
+its limit bounds the inspected inventory rather than promising a globally largest list.
+
+`worktrees usage` performs bounded local allocated-size and Git-status inspection.
+It reports incomplete inventory, scan limits, unavailable measurements and remote
+hosts explicitly. Disk estimates include build/ignored files but do not predict
+APFS shared-block reclamation. `worktrees ps` exposes attached/live/unverifiable
+terminal counts without previews or agent prompts.
+
+`worktrees inventory --include-external` combines Orca's returned inventory with
+read-only Git metadata from **registered Orca repositories only**. It can expose Git
+entries omitted by repository visibility settings. Native archived state, detached
+HEAD, locked, Git-reported prunable, and missing paths are separate facts with source
+and coverage metadata. Git-discovered does not mean unregistered or safe to delete;
+an exact selector is supplied only after native identity resolution. Use `--repo`
+to narrow it. This command changes no visibility setting and performs no pruning.
+
+Choose a target after inspecting it, then use an explicit action:
+
+```sh
+orca-bridge terminals stop HANDLE --expected-incarnation INCARNATION
+orca-bridge worktrees remove identity:WORKTREE_KEY --dry-run --json
+orca-bridge worktrees remove identity:WORKTREE_KEY
+```
+
+Stopping preserves conversation history. Removal refuses main/base repositories,
+live or unverifiable terminals, and dirty/untracked work unless `--force` is supplied
+for the Git changes. It delegates deletion to Orca, which may also delete a provably
+merged local branch. Archive hooks are skipped by default; `--run-hooks` enables
+them, and `--allow-failed-archive-hook` is a separate deliberate override. Nothing
+automatically picks or stops sessions or deletes directories.
+
+Preview reports the exact target, structured blockers and branch/hook effects; it
+never runs hooks or removes anything. Inspect `allowed` rather than just exit status.
+Execution repeats fresh preflight. The removal receipt distinguishes native
+acknowledgement from verified filesystem/inventory read-back; unknown outcomes are
+not automatically retried. Inspection rows include copyable `worktreeSelector`
+values when exact instance identity is available. Offline contracts are available
+as `schema worktree-usage`, `schema removal-plan` and `schema removal-receipt`.
+`schema worktree-inventory` describes the Git-inclusive inventory.
+[Resource and cleanup contracts](docs/resources.md).
+
+## Route work into the right project
+
+Use an explicitly selected existing worktree for another project's task:
+
+```sh
+cat handoff.txt | orca-bridge sessions create \
+  --worktree path:/absolute/target-project --agent codex --prompt - --json
+```
+
+`sessions create` requires exactly one of `--worktree` or `--project`; it never
+silently defaults to the caller's folder. `--project` plus `--name` creates a new
+checkout. Inspect Orca's returned `outcome` and `receipt` before claiming a handoff.
+For an ambiguous existing-worktree launch, repeat the same request with
+`--retry-launch OPERATION_ID`; do not launch a fresh duplicate. Agent routing policy
+belongs in shared instructions; Bridge exposes the target, action and evidence.
+[Routing policy and verification](docs/routing.md).
+
 ## Compose it with other tools
 
 Pipes default to JSON. `--json` produces one result; `--jsonl` produces one list entry
 per line. Streams always produce JSONL and flush each record. Diagnostics go to stderr;
 a downstream broken pipe is a successful exit.
+
+For compact finite read output, select top-level fields. List results project each
+row; missing fields are null. Coverage, truncation, warnings and preview blockers
+are retained automatically. `--fields` implies JSON and supports `--jsonl`, but is
+rejected before mutations and streams so formatting cannot hide an action outcome.
+
+```sh
+orca-bridge recent --fields id,title,agent --jsonl
+orca-bridge resources --fields terminals,orcaTotal --json
+orca-bridge worktrees remove identity:WORKTREE_KEY --dry-run --fields target,checks --json
+```
+
+Native helper calls default to **60 seconds and 8 MiB combined stdout/stderr**.
+`--command-timeout` (1–3600 seconds) and `--max-output-bytes` (1–32 MiB) override
+`ORCA_BRIDGE_COMMAND_TIMEOUT_SECS` and `ORCA_BRIDGE_MAX_OUTPUT_BYTES`, then defaults.
+These bound the delegated CLI, not the agent task. Use a helper deadline longer than
+`--wait-submit` when observing a long submission. Timeout/cancellation kills only
+Bridge's owned helper group; a runtime action may already have happened.
+
+`--json-errors` emits a versioned error envelope on **stderr**, keeping stdout clean
+and existing exit codes. It includes a stable Bridge code, native code and safe
+recovery IDs when supplied. `outcome` is `not-started`, `failed` with explicit proof,
+or `unknown`; a failed helper/transport is not proof of an unperformed mutation.
+Inspect before retrying, reuse the original native request/operation ID, and never
+automatically retry removal. `schema error` documents the envelope.
+
+`doctor --json` now separates advertised runtime support from the installed CLI's
+offline command/flag support. Features are `supported`, `unsupported` or `unknown`;
+version numbers or a missing advertisement alone never establish support. Discovery
+does not launch, send, stop, delete, or run a memory sweep.
+[Automation contracts and error recovery](docs/automation.md).
 
 ```sh
 # Search a supplied session list without touching Orca's index.
@@ -351,6 +513,7 @@ make format
 make check          # No Orca app, credentials or live data required
 make build          # Optimized, locked release build
 make smoke          # Read-only checks against running Orca
+make smoke-resources # Live resource/disk/preview/capability checks; no cleanup
 make smoke-native   # Native push; creates and closes one disposable terminal
 make profile        # Read-only phase and whole-process latency measurements
 ```
@@ -361,6 +524,11 @@ JSON output, bounded cancellation, exact runtime/session identity and explicit u
 
 [Architecture](docs/architecture.md) · [Compatibility](docs/compatibility.md) ·
 [Agent guide](docs/agent-guide.md) · [UI data](docs/ui-data.md)
+
+[Usage review and resulting improvements](docs/usage-review.md) records the local
+history audit, its coverage limits and verification.
+
+[Changes and migration notes](CHANGELOG.md) describe the 0.2.0 command contracts.
 
 ## License
 

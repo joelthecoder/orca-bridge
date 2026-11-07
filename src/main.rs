@@ -1,14 +1,17 @@
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use orca_bridge::{
-    actions, config::Config, events, history, model::Session, projects, rpc::RpcClient,
-    session_organization, skills, stream, terminal, ui,
+    actions, capabilities, config::Config, errors, events, history, model::Session, output,
+    process, projects, resources, rpc::RpcClient, session_organization, skills, stream, terminal,
+    ui, worktrees,
 };
 use serde_json::{Value, json};
 use std::io::{self, BufRead, IsTerminal, Read, Write};
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+static JSON_ERRORS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(
@@ -19,6 +22,18 @@ use std::time::{Duration, Instant};
     after_help = "QUICK START\n  orca-bridge search 'migration'\n  orca-bridge recent --limit 10\n  orca-bridge terminals list\n  orca-bridge watch --topics sessions,status --timeout 5\n\nFOR AGENTS\n  orca-bridge help --json       Complete machine-readable command tree\n  orca-bridge agent             Portable usage guide and automation contracts\n\nPipes default to JSON. Streams emit JSONL. Diagnostics go to stderr.\nUse --help on any command, or `orca -- <args>` for the installed Orca CLI."
 )]
 struct Cli {
+    /// Emit a versioned JSON error on stderr; exit codes and stdout stay unchanged
+    #[arg(long, global = true)]
+    json_errors: bool,
+    /// Deadline for each delegated native CLI call (1–3600 seconds)
+    #[arg(long, global = true)]
+    command_timeout: Option<u64>,
+    /// Combined output cap for each delegated native CLI call (1–33554432 bytes)
+    #[arg(long, global = true)]
+    max_output_bytes: Option<usize>,
+    /// Select top-level JSON fields on finite read commands; completeness metadata is retained
+    #[arg(long, global = true, value_delimiter = ',', conflicts_with_all = ["human", "alfred"])]
+    fields: Vec<String>,
     #[arg(long, global=true, conflicts_with_all=["jsonl", "alfred"])]
     /// Emit one machine-readable JSON result
     json: bool,
@@ -49,6 +64,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Generate shell completion scripts without Orca or runtime access
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Print the bundled assistant skill, or explicitly install it for Claude/Codex
     #[command(alias = "skills")]
     Skill {
@@ -62,6 +82,23 @@ enum Command {
         /// Include project artwork data; omitted by default to keep snapshots compact
         #[arg(long)]
         icons: bool,
+    },
+    /// Inspect Orca app and managed terminal process-tree memory/CPU; never stops anything
+    Resources {
+        /// Restrict terminal rows to this exact current runtime handle
+        #[arg(long)]
+        terminal: Option<String>,
+        /// Restrict usage to one explicitly selected worktree
+        #[arg(long, conflicts_with = "repo")]
+        worktree: Option<String>,
+        /// Restrict usage to a registered repository selector
+        #[arg(long, conflicts_with = "worktree")]
+        repo: Option<String>,
+        #[arg(long, value_enum, default_value = "memory")]
+        sort: resources::SortBy,
+        /// Maximum terminal rows after scope and ranking (1–2000)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Print generated JSON Schema for a data type, without Orca access
     Schema {
@@ -98,7 +135,7 @@ enum Command {
         #[command(subcommand)]
         command: ProjectCommand,
     },
-    /// Inspect or create worktrees
+    /// Inspect worktree disk/process usage, create worktrees, or explicitly remove one
     Worktrees {
         #[command(subcommand)]
         command: WorktreeCommand,
@@ -203,6 +240,20 @@ enum SessionCommand {
         /// Include bounded provider usage counters
         usage: bool,
     },
+    /// Read recent text messages from local Codex/Claude history with explicit truncation
+    Messages {
+        /// Durable item ID; session commands also accept unique session prefixes
+        id: String,
+        /// Maximum number of matching messages, returned in source order
+        #[arg(short, long, default_value = "20")]
+        limit: NonZeroUsize,
+        /// Include only this speaker; tool calls/results are always omitted
+        #[arg(long, value_enum)]
+        role: Option<MessageRole>,
+        /// Maximum source bytes to inspect, up to 16777216 (16 MiB)
+        #[arg(long, default_value = "2097152")]
+        max_bytes: NonZeroUsize,
+    },
     Usage {
         /// Durable item ID; session commands also accept unique session prefixes
         id: String,
@@ -225,29 +276,18 @@ enum SessionCommand {
         terminal: bool,
     },
     /// Stream the source transcript without rewriting its records
-    Transcript {
-        /// Durable item ID; session commands also accept unique session prefixes
-        id: String,
-        #[arg(short, long)]
-        /// Keep following appended transcript records
-        follow: bool,
-        #[arg(long)]
-        /// Start at the end of the transcript
-        tail: bool,
-        #[arg(long)]
-        /// Stop after this many data records
-        count: Option<usize>,
-        #[arg(long)]
-        /// Stop after this many seconds
-        timeout: Option<u64>,
-    },
+    Transcript(Transcript),
     /// Show terminals with explicit attention or waiting status
     Attention,
     Create {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "project", required_unless_present = "project")]
         /// Orca worktree selector, such as path:/absolute/project
         worktree: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            conflicts_with = "worktree",
+            required_unless_present = "worktree"
+        )]
         /// Durable Orca project ID
         project: Option<String>,
         #[arg(long)]
@@ -267,20 +307,16 @@ enum SessionCommand {
         #[arg(long)]
         /// Reveal the created session or terminal in Orca
         focus: bool,
+        /// Retry the same native launch operation after an ambiguous reply; existing worktree only
+        #[arg(long, requires = "worktree", conflicts_with = "project")]
+        retry_launch: Option<String>,
     },
     /// Send literal text to a live terminal; '-' consumes stdin
     Send {
         /// Live runtime-issued terminal handle; discover with terminals list
         terminal: String,
-        #[arg(long, default_value = "-")]
-        /// Literal input text; use - to read stdin
-        text: String,
-        #[arg(long)]
-        /// Submit Enter after the literal text
-        enter: bool,
-        #[arg(long)]
-        /// Request interrupt-style input when supported by Orca
-        interrupt: bool,
+        #[command(flatten)]
+        input: SendOptions,
     },
 }
 
@@ -295,6 +331,49 @@ enum SessionNamesCommand {
     Apply { plan_id: String },
     /// Undo a native naming change only where its applied versions still match
     Undo { change_id: String },
+}
+#[derive(Args)]
+struct SendOptions {
+    /// Literal input text; use - to read stdin
+    #[arg(long, default_value = "-")]
+    text: String,
+    /// Submit Enter after the literal text
+    #[arg(long)]
+    enter: bool,
+    /// Request interrupt-style input when supported by Orca
+    #[arg(long)]
+    interrupt: bool,
+    /// Observe this accepted prompt for N seconds; timeout never resends
+    #[arg(long, requires = "enter")]
+    wait_submit: Option<u64>,
+    /// Retry the same native prompt request after an ambiguous reply; repeat the exact payload
+    #[arg(long, requires = "enter")]
+    retry_request: Option<String>,
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum MessageRole {
+    User,
+    Assistant,
+}
+#[derive(Args)]
+struct Transcript {
+    /// Durable item ID; session commands also accept unique session prefixes
+    id: String,
+    /// Keep following appended transcript records
+    #[arg(short, long)]
+    follow: bool,
+    /// Start at the end of the transcript
+    #[arg(long, conflicts_with = "last")]
+    tail: bool,
+    /// Start with the latest N nonblank records, in source order
+    #[arg(long)]
+    last: Option<NonZeroUsize>,
+    /// Stop after this many data records (must be positive)
+    #[arg(long)]
+    count: Option<NonZeroUsize>,
+    /// Stop after this many seconds
+    #[arg(long)]
+    timeout: Option<u64>,
 }
 #[derive(Args)]
 struct AutomationTarget {
@@ -442,6 +521,56 @@ enum ProjectIconCommand {
 }
 #[derive(Subcommand)]
 enum WorktreeCommand {
+    /// Inspect registered-repository worktrees, including optional Git-discovered hidden entries
+    Inventory {
+        #[arg(long)]
+        repo: Option<String>,
+        /// Include Git entries omitted from Orca's normal list; never marks them safe to delete
+        #[arg(long)]
+        include_external: bool,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Total read-only enumeration budget in seconds (1–120)
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
+    /// Inspect allocated disk estimates and Git changes; no deletion or automatic cleanup
+    Usage {
+        /// Inspect one explicit worktree; omitted lists a bounded inventory
+        #[arg(long, conflicts_with = "repo")]
+        worktree: Option<String>,
+        /// Inspect a bounded inventory belonging to this registered repository
+        #[arg(long, conflicts_with = "worktree")]
+        repo: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Total local measurement budget in seconds (1–120)
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
+    /// Inspect native worktree liveness and orchestration counts, omitting previews/prompts
+    Ps {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Remove one stopped local linked worktree; Orca may also delete its merged local branch
+    #[command(alias = "rm")]
+    Remove {
+        /// Explicit worktree selector; active/current is deliberately refused
+        selector: String,
+        /// Preview exact target, blockers and side effects without hooks or deletion
+        #[arg(long)]
+        dry_run: bool,
+        /// Permit dirty/untracked removal; does not bypass main-worktree or live-terminal guards
+        #[arg(long)]
+        force: bool,
+        /// Run repository archive hooks before removal (native default is to skip them)
+        #[arg(long)]
+        run_hooks: bool,
+        /// Deliberately waive a failed archive hook; requires --run-hooks
+        #[arg(long, requires = "run_hooks")]
+        allow_failed_archive_hook: bool,
+    },
     List {
         #[arg(long)]
         /// Durable Orca project ID
@@ -487,7 +616,12 @@ enum TerminalCommand {
     /// Set the live tab title, or pass an empty title to reset it
     Rename { terminal: String, title: String },
     /// Stop this exact live PTY, preserving recorded conversation history
-    Stop { terminal: String },
+    Stop {
+        terminal: String,
+        /// Refuse if the terminal changed since a resource snapshot
+        #[arg(long)]
+        expected_incarnation: Option<String>,
+    },
     /// Close a terminal pane, or its entire tab with --tab
     Close {
         terminal: String,
@@ -510,18 +644,21 @@ enum TerminalCommand {
         /// Live runtime-issued terminal handle; discover with terminals list
         terminal: String,
         #[arg(long)]
-        /// Output cursor returned by a previous terminal read
-        cursor: Option<u64>,
+        /// Opaque output cursor returned by a previous terminal read
+        cursor: Option<String>,
         #[arg(long, default_value_t = 65536)]
         /// Maximum number of returned entries
         limit: usize,
+        /// Keep only the latest N native terminal tail rows, preserving metadata and draft
+        #[arg(long)]
+        tail: Option<NonZeroUsize>,
     },
     Follow {
         /// Live runtime-issued terminal handle; discover with terminals list
         terminal: String,
         #[arg(long)]
-        /// Output cursor returned by a previous terminal read
-        cursor: Option<u64>,
+        /// Opaque output cursor returned by a previous terminal read
+        cursor: Option<String>,
         #[arg(long, default_value_t = 250)]
         /// Polling interval in milliseconds, minimum 100
         interval_ms: u64,
@@ -539,15 +676,8 @@ enum TerminalCommand {
     Send {
         /// Live runtime-issued terminal handle; discover with terminals list
         terminal: String,
-        #[arg(long, default_value = "-")]
-        /// Literal input text; use - to read stdin
-        text: String,
-        #[arg(long)]
-        /// Submit Enter after the literal text
-        enter: bool,
-        #[arg(long)]
-        /// Request interrupt-style input when supported by Orca
-        interrupt: bool,
+        #[command(flatten)]
+        input: SendOptions,
     },
     Create {
         #[arg(long)]
@@ -685,9 +815,17 @@ enum SchemaEntity {
     Session,
     SessionView,
     Snapshot,
+    Resources,
+    WorktreeUsage,
+    WorktreeInventory,
+    RemovalPlan,
+    RemovalReceipt,
+    Error,
 }
 #[derive(Subcommand)]
 enum SkillCommand {
+    /// Print the focused cross-project routing policy and handoff procedure
+    Routing,
     /// Install the bundled skill, preserving existing different skills and symlinks
     Install {
         #[arg(long, conflicts_with = "codex", required_unless_present = "codex")]
@@ -705,6 +843,8 @@ enum Format {
 }
 
 fn emit(value: &Value, format: Format, out: &mut impl Write) -> Result<()> {
+    let projected = output::project_configured(value)?;
+    let value = &projected;
     match format {
         Format::Json => {
             serde_json::to_writer_pretty(&mut *out, value)?;
@@ -790,7 +930,7 @@ fn filters(mut sessions: Vec<Session>, list: &List) -> Result<Vec<Session>> {
             && list
                 .path
                 .as_ref()
-                .is_none_or(|p| s.cwd.as_ref().is_some_and(|c| c.starts_with(p)))
+                .is_none_or(|p| s.cwd.as_ref().is_some_and(|c| Path::new(c).starts_with(p)))
             && since.is_none_or(|d| {
                 s.updated_at
                     .as_deref()
@@ -841,27 +981,27 @@ fn search(config: &Config, s: Search) -> Result<Value> {
         s.list.limit,
     ))?)
 }
-fn send(
-    config: &Config,
-    terminal: String,
-    text: String,
-    enter: bool,
-    interrupt: bool,
-) -> Result<Value> {
+fn send(config: &Config, terminal: String, input: SendOptions) -> Result<Value> {
     let mut args = vec![
         "terminal".into(),
         "send".into(),
         "--terminal".into(),
         terminal,
         "--text".into(),
-        literal(text)?,
+        literal(input.text)?,
     ];
-    if enter {
+    if input.enter {
         args.push("--enter".into());
     }
-    if interrupt {
+    if input.interrupt {
         args.push("--interrupt".into());
     }
+    optional_arg(
+        &mut args,
+        "--wait-submit",
+        input.wait_submit.map(|value| value.to_string()),
+    );
+    optional_arg(&mut args, "--retry-request", input.retry_request);
     actions::orca(config, &args)
 }
 fn automation(config: &Config, command: AutomationCommand) -> Result<Value> {
@@ -979,6 +1119,27 @@ fn run_session(
             }
             serde_json::to_value(s)?
         }
+        SessionCommand::Messages {
+            id,
+            limit,
+            role,
+            max_bytes,
+        } => {
+            ensure!(
+                max_bytes.get() <= 16 * 1024 * 1024,
+                "--max-bytes must be at most 16777216 (16 MiB)"
+            );
+            let role = role.map(|role| match role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+            });
+            orca_bridge::messages::read(
+                &history::get_session(config, &id)?,
+                limit.get(),
+                role,
+                max_bytes.get(),
+            )?
+        }
         SessionCommand::Usage { id } => history::usage(&history::get_session(config, &id)?)?,
         SessionCommand::Open { id } => {
             actions::open_session(config, &history::get_session(config, &id)?)?
@@ -1004,13 +1165,7 @@ fn run_session(
             }
             value
         }
-        SessionCommand::Transcript {
-            id,
-            follow,
-            tail,
-            count,
-            timeout,
-        } => return transcript(config, &id, follow, tail, count, timeout, out),
+        SessionCommand::Transcript(options) => return transcript(config, options, out),
         SessionCommand::Attention => {
             let rpc = RpcClient::new(config);
             let t = rpc.call("terminal.list", json!({"includeVisualLayouts":false}))?;
@@ -1031,12 +1186,7 @@ fn run_session(
             }
             json!(rows)
         }
-        SessionCommand::Send {
-            terminal,
-            text,
-            enter,
-            interrupt,
-        } => send(config, terminal, text, enter, interrupt)?,
+        SessionCommand::Send { terminal, input } => send(config, terminal, input)?,
         SessionCommand::Create {
             worktree,
             project,
@@ -1046,7 +1196,21 @@ fn run_session(
             effort,
             prompt,
             focus,
+            retry_launch,
         } => {
+            if let Some(target) = worktree.as_deref() {
+                ensure!(
+                    !target.trim().is_empty()
+                        && !matches!(target.trim(), "active" | "current" | "all" | "*"),
+                    "Session creation requires an explicit target worktree, not active/current/all"
+                );
+            }
+            if let Some(target) = project.as_deref() {
+                ensure!(
+                    !target.trim().is_empty(),
+                    "Project target must not be empty"
+                );
+            }
             let mut args = if let Some(project) = project {
                 vec![
                     "worktree".into(),
@@ -1068,6 +1232,7 @@ fn run_session(
             optional_arg(&mut args, "--model", model);
             optional_arg(&mut args, "--effort", effort);
             optional_arg(&mut args, "--prompt", prompt.map(literal).transpose()?);
+            optional_arg(&mut args, "--retry-launch", retry_launch);
             if focus {
                 args.push(
                     if args[0] == "worktree" {
@@ -1100,16 +1265,64 @@ fn run_watch(config: &Config, w: Watch, out: &mut impl Write) -> Result<()> {
         out,
     )
 }
-fn transcript(
-    config: &Config,
-    id: &str,
-    follow: bool,
-    tail: bool,
-    count: Option<usize>,
-    timeout: Option<u64>,
-    out: &mut impl Write,
-) -> Result<()> {
-    let session = history::get_session(config, id)?;
+
+fn worktree_ps(config: &Config, limit: usize) -> Result<Value> {
+    ensure!(
+        (1..=2000).contains(&limit),
+        "Worktree process limit must be between 1 and 2000"
+    );
+    let native = RpcClient::new(config).call("worktree.ps", json!({"limit":limit}))?;
+    let rows = native["worktrees"]
+        .as_array()
+        .context("Missing worktree process inventory")?;
+    let projected = rows
+        .iter()
+        .take(limit)
+        .map(|row| {
+            let mut result = serde_json::Map::new();
+            for key in [
+                "worktreeId",
+                "repoId",
+                "hostId",
+                "repo",
+                "path",
+                "branch",
+                "displayName",
+                "isMainWorktree",
+                "isArchived",
+                "isActive",
+                "worktreeInstanceId",
+                "liveTerminalCount",
+                "hasAttachedPty",
+                "unverifiableTerminalCount",
+                "terminalVerdict",
+                "lastOutputAt",
+                "lastActivityAt",
+            ] {
+                if let Some(value) = row
+                    .get(key)
+                    .filter(|value| !value.is_array() && !value.is_object())
+                {
+                    result.insert(key.into(), value.clone());
+                }
+            }
+            Value::Object(result)
+        })
+        .collect::<Vec<_>>();
+    Ok(
+        json!({"schemaVersion":1,"worktrees":projected,"hostScope":native["hostScope"],"totalCount":native["totalCount"],"truncated":if rows.len() > limit {Value::Bool(true)} else {native["truncated"].clone()}}),
+    )
+}
+fn transcript(config: &Config, options: Transcript, out: &mut impl Write) -> Result<()> {
+    let Transcript {
+        id,
+        follow,
+        tail,
+        last,
+        count,
+        timeout,
+    } = options;
+    let session = history::get_session(config, &id)?;
     let path = PathBuf::from(
         session
             .file_path
@@ -1118,10 +1331,17 @@ fn transcript(
     ensure!(path.is_file(), "Transcript is not a local file");
     use std::io::{Seek, SeekFrom};
     let mut file = std::fs::File::open(&path)?;
-    let mut offset = if tail { file.metadata()?.len() } else { 0 };
+    let mut offset = if tail {
+        file.metadata()?.len()
+    } else if let Some(last) = last {
+        orca_bridge::transcript::suffix_start(&mut file, last.get(), !follow)?
+    } else {
+        0
+    };
     let start = Instant::now();
     let mut emitted = 0usize;
     let mut pending = Vec::new();
+    let mut scanned = 0usize;
     loop {
         if events::STOP.load(Ordering::Relaxed)
             || timeout.is_some_and(|s| start.elapsed() >= Duration::from_secs(s))
@@ -1131,31 +1351,36 @@ fn transcript(
         if file.metadata()?.len() < offset {
             offset = 0;
             pending.clear();
+            scanned = 0;
         }
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0u8; 65536];
         let n = file.read(&mut bytes)?;
         offset += n as u64;
         pending.extend_from_slice(&bytes[..n]);
-        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+        while let Some(end) = pending[scanned..].iter().position(|b| *b == b'\n') {
+            let end = scanned + end;
+            ensure!(end <= 16 * 1024 * 1024, "Transcript record exceeds 16 MiB");
             let line = pending.drain(..=end).collect::<Vec<_>>();
+            scanned = 0;
             if !line.iter().all(u8::is_ascii_whitespace) {
                 let value: Value = serde_json::from_slice(&line)
                     .context("Transcript is not JSONL (this provider may use a database)")?;
                 crate::line(&value, out)?;
                 emitted += 1;
-                if count.is_some_and(|c| emitted >= c) {
+                if count.is_some_and(|c| emitted >= c.get()) {
                     return Ok(());
                 }
             }
         }
+        scanned = pending.len();
         ensure!(
             pending.len() <= 16 * 1024 * 1024,
             "Transcript record exceeds 16 MiB"
         );
         if n == 0 {
             if !follow {
-                if !pending.is_empty() {
+                if !pending.iter().all(u8::is_ascii_whitespace) {
                     let v: Value = serde_json::from_slice(&pending)
                         .context("Incomplete final transcript record")?;
                     line(&v, out)?;
@@ -1167,34 +1392,64 @@ fn transcript(
     }
     Ok(())
 }
+// Orca returns decimal strings but its terminal.read RPC expects numeric line
+// cursors. Keep callers opaque to the encoding; retain unknown string formats.
+fn terminal_cursor(cursor: &str) -> Value {
+    cursor
+        .parse::<u64>()
+        .map_or_else(|_| Value::String(cursor.to_owned()), Value::from)
+}
+
 fn terminal_follow(
     config: &Config,
     terminal: &str,
-    cursor: Option<u64>,
+    cursor: Option<String>,
     interval: u64,
     count: Option<usize>,
     timeout: Option<u64>,
     out: &mut impl Write,
 ) -> Result<()> {
     ensure!(interval >= 100, "Minimum interval is 100 ms");
+    ensure!(count != Some(0), "--count must be positive");
     let rpc = RpcClient::new(config);
-    let mut cursor = cursor;
+    let mut cursor = cursor.as_deref().map(terminal_cursor);
     let start = Instant::now();
     let mut emitted = 0usize;
     while !events::STOP.load(Ordering::Relaxed)
         && timeout.is_none_or(|s| start.elapsed() < Duration::from_secs(s))
     {
         let mut params = json!({"terminal":terminal,"limit":65536});
-        if let Some(cursor) = cursor {
-            params["cursor"] = cursor.into();
+        if let Some(cursor) = cursor.as_ref() {
+            params["cursor"] = cursor.clone();
         }
-        let value = rpc.call("terminal.read", params)?;
-        let next = value.get("nextCursor").and_then(Value::as_u64).or_else(|| {
-            value
-                .pointer("/terminal/nextCursor")
-                .and_then(Value::as_u64)
-        });
-        if next != cursor || emitted == 0 {
+        let remaining = timeout.map(|s| Duration::from_secs(s).saturating_sub(start.elapsed()));
+        if remaining.is_some_and(|duration| duration.is_zero()) {
+            break;
+        }
+        let client = rpc.clone().with_timeout(
+            remaining
+                .unwrap_or(Duration::from_secs(10))
+                .min(Duration::from_secs(10)),
+        );
+        let value = match client.call("terminal.read", params) {
+            Ok(value) => value,
+            Err(_) if timeout.is_some_and(|s| start.elapsed() >= Duration::from_secs(s)) => break,
+            Err(error) => return Err(error),
+        };
+        let next = value
+            .get("nextCursor")
+            .filter(|cursor| cursor.is_string() || cursor.is_number())
+            .or_else(|| {
+                value
+                    .pointer("/terminal/nextCursor")
+                    .filter(|cursor| cursor.is_string() || cursor.is_number())
+            })
+            .map(|cursor| {
+                cursor
+                    .as_str()
+                    .map_or_else(|| cursor.clone(), terminal_cursor)
+            });
+        if next != cursor || (emitted == 0 && cursor.is_none()) {
             line(
                 &json!({"topic":"terminal.output","terminal":terminal,"data":value}),
                 out,
@@ -1205,7 +1460,10 @@ fn terminal_follow(
             }
         }
         cursor = next.or(cursor);
-        std::thread::sleep(Duration::from_millis(interval));
+        let pause = Duration::from_millis(interval);
+        std::thread::sleep(timeout.map_or(pause, |s| {
+            pause.min(Duration::from_secs(s).saturating_sub(start.elapsed()))
+        }));
     }
     Ok(())
 }
@@ -1245,6 +1503,7 @@ fn run_rpc(config: &Config, r: Rpc, format: Format, out: &mut impl Write) -> Res
 fn command_effect(path: &[String]) -> &'static str {
     let p = path.iter().map(String::as_str).collect::<Vec<_>>();
     match p.as_slice() {
+        ["worktrees", "remove"] => "runtime-write-and-filesystem-delete",
         ["automations", "create" | "edit" | "run" | "remove"] => "runtime-write",
         ["rpc", ..] | ["orca", ..] => "depends-on-method",
         ["stream", "pair"] => "local-credential-write",
@@ -1312,6 +1571,19 @@ fn describe_command(command: &clap::Command, path: Vec<String>) -> Value {
         "examplesAndNotes":command.get_after_long_help().or(command.get_after_help()).map(ToString::to_string)})
 }
 
+fn routing_contract() -> Value {
+    json!({"schemaVersion":1,"policy":"route-cross-project-implementation",
+        "explicitUserInstructionsOverride":true,"explicitTargetRequired":true,
+        "inProcessSubagentIsCrossProjectHandoff":false,"silentLocalFallbackAllowed":false,
+        "discovery":["projects list --json","worktrees list --repo SELECTOR --json","worktrees show SELECTOR --json"],
+        "launch":{"command":"sessions create","existingTargetFlag":"--worktree","agentFlag":"--agent","stdinPromptFlags":["--prompt","-"],"outputFlags":["--json","--json-errors"]},
+        "verify":["resolved target worktree","native outcome and receipt","prompt delivery distinct from launch acceptance","task completion distinct from delivery"],
+        "ambiguousLaunch":{"inspectBeforeRetry":true,"retryFlag":"--retry-launch","reuseOriginalOperationId":true,"freshDuplicateAllowed":false},
+        "ambiguousPrompt":{"retryFlag":"--retry-request","observeFlag":"--wait-submit","repeatExactPayload":true,"timeoutResends":false},
+        "failureAction":"report-blocker-and-continue-independent-coordinator-work",
+        "enforcement":"agent-policy-not-a-filesystem-permission-boundary"})
+}
+
 fn command_help(path: &[String], as_json: bool) -> Result<()> {
     let mut root = Cli::command().color(terminal::color_choice());
     root.build();
@@ -1342,18 +1614,69 @@ fn command_help(path: &[String], as_json: bool) -> Result<()> {
 
 fn run() -> Result<()> {
     let choice = terminal::color_choice();
-    let matches = Cli::command().color(choice).get_matches();
+    let matches = Cli::command().color(choice).try_get_matches()?;
+    let mut command_path = Vec::new();
+    let mut cursor = &matches;
+    while let Some((name, child)) = cursor.subcommand() {
+        command_path.push(name.to_owned());
+        cursor = child;
+    }
     let cli = Cli::from_arg_matches(&matches)?;
+    JSON_ERRORS.store(cli.json_errors, Ordering::Relaxed);
+    if cli.command_timeout.is_some() || cli.max_output_bytes.is_some() {
+        process::configure_command_limits(cli.command_timeout, cli.max_output_bytes)?;
+    }
+    let compact = !cli.fields.is_empty();
+    if compact {
+        let preview = matches!(
+            &cli.command,
+            Command::Worktrees {
+                command: WorktreeCommand::Remove { dry_run: true, .. }
+            }
+        );
+        let finite = !matches!(
+            &cli.command,
+            Command::Completions { .. }
+                | Command::Help { .. }
+                | Command::Schema { .. }
+                | Command::Agent
+                | Command::Skill { .. }
+                | Command::Filter { .. }
+        );
+        if !finite || (command_effect(&command_path) != "read" && !preview) {
+            return Err(errors::BridgeError::new(errors::ErrorCode::InvalidArguments, "--fields is supported only for finite read commands and removal previews; no action was started", errors::Outcome::NotStarted).into());
+        }
+    }
+    output::configure(cli.fields.clone()).map_err(|error| {
+        errors::BridgeError::new(
+            errors::ErrorCode::InvalidArguments,
+            error.to_string(),
+            errors::Outcome::NotStarted,
+        )
+    })?;
     terminal::configure(choice);
+    if let Command::Completions { shell } = &cli.command {
+        let mut bytes = Vec::new();
+        clap_complete::generate(*shell, &mut Cli::command(), "orca-bridge", &mut bytes);
+        io::stdout().lock().write_all(&bytes)?;
+        return Ok(());
+    }
     if let Command::Skill { command } = &cli.command {
         let mut out = io::stdout().lock();
         return match command {
             None if cli.json => line(
-                &json!({"name":"orca-bridge","cliVersion":env!("CARGO_PKG_VERSION"),"markdown":skills::MARKDOWN}),
+                &json!({"name":"orca-bridge","cliVersion":env!("CARGO_PKG_VERSION"),"markdown":skills::MARKDOWN,"guides":["routing"],"routing":routing_contract()}),
                 &mut out,
             ),
             None => out
                 .write_all(skills::MARKDOWN.as_bytes())
+                .map_err(Into::into),
+            Some(SkillCommand::Routing) if cli.json => line(
+                &json!({"schemaVersion":1,"name":"orca-bridge-routing","cliVersion":env!("CARGO_PKG_VERSION"),"markdown":include_str!("../docs/routing.md"),"routing":routing_contract()}),
+                &mut out,
+            ),
+            Some(SkillCommand::Routing) => out
+                .write_all(include_str!("../docs/routing.md").as_bytes())
                 .map_err(Into::into),
             Some(SkillCommand::Install { claude, .. }) => {
                 let home = PathBuf::from(std::env::var_os("HOME").context("HOME missing")?);
@@ -1377,6 +1700,12 @@ fn run() -> Result<()> {
             SchemaEntity::Session => schemars::schema_for!(Session),
             SchemaEntity::SessionView => schemars::schema_for!(ui::SessionView),
             SchemaEntity::Snapshot => schemars::schema_for!(ui::Snapshot),
+            SchemaEntity::Resources => schemars::schema_for!(resources::ResourceSnapshot),
+            SchemaEntity::WorktreeUsage => schemars::schema_for!(worktrees::UsageSnapshot),
+            SchemaEntity::WorktreeInventory => schemars::schema_for!(worktrees::WorktreeInventory),
+            SchemaEntity::RemovalPlan => schemars::schema_for!(worktrees::RemovalPlan),
+            SchemaEntity::RemovalReceipt => schemars::schema_for!(worktrees::RemovalReceipt),
+            SchemaEntity::Error => schemars::schema_for!(errors::ErrorEnvelope),
         };
         return emit(
             &serde_json::to_value(schema)?,
@@ -1404,7 +1733,7 @@ fn run() -> Result<()> {
         Format::Jsonl
     } else if cli.human {
         Format::Text
-    } else if cli.json || !io::stdout().is_terminal() {
+    } else if cli.json || compact || !io::stdout().is_terminal() {
         Format::Json
     } else {
         Format::Text
@@ -1412,7 +1741,11 @@ fn run() -> Result<()> {
     ctrlc::set_handler(|| events::STOP.store(true, Ordering::Relaxed))?;
     let mut out = io::stdout().lock();
     match cli.command {
-        Command::Help { .. } | Command::Agent | Command::Schema { .. } | Command::Skill { .. } => {
+        Command::Completions { .. }
+        | Command::Help { .. }
+        | Command::Agent
+        | Command::Schema { .. }
+        | Command::Skill { .. } => {
             unreachable!()
         }
         Command::Snapshot { limit, icons } => emit(
@@ -1420,6 +1753,50 @@ fn run() -> Result<()> {
             format,
             &mut out,
         ),
+        Command::Resources {
+            terminal,
+            worktree,
+            repo,
+            sort,
+            limit,
+        } => {
+            ensure!(
+                (1..=2000).contains(&limit),
+                "Resource limit must be between 1 and 2000"
+            );
+            let rpc = RpcClient::new(&config);
+            let worktree_id = worktree
+                .map(|selector| {
+                    rpc.call("worktree.show", json!({"worktree":selector}))
+                        .and_then(|row| {
+                            row.pointer("/worktree/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .context("Selected worktree has no ID")
+                        })
+                })
+                .transpose()?;
+            let repo_id = repo
+                .map(|selector| {
+                    rpc.call("repo.show", json!({"repo":selector}))
+                        .and_then(|row| {
+                            row.pointer("/repo/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .context("Selected repository has no ID")
+                        })
+                })
+                .transpose()?;
+            let report = resources::select_scoped(
+                resources::capture(&config)?,
+                terminal.as_deref(),
+                worktree_id.as_deref(),
+                repo_id.as_deref(),
+                limit,
+                sort,
+            )?;
+            emit(&serde_json::to_value(report)?, format, &mut out)
+        }
         Command::Automations { command } => emit(&automation(&config, command)?, format, &mut out),
         Command::Sessions { command } => run_session(&config, command, format, &mut out),
         Command::Recent(list) => {
@@ -1471,6 +1848,82 @@ fn run() -> Result<()> {
         Command::Worktrees { command } => {
             let mut args = vec!["worktree".into()];
             match command {
+                WorktreeCommand::Inventory {
+                    repo,
+                    include_external,
+                    limit,
+                    timeout,
+                } => {
+                    ensure!(
+                        (1..=120).contains(&timeout),
+                        "Worktree inventory timeout must be between 1 and 120 seconds"
+                    );
+                    return emit(
+                        &worktrees::inventory(
+                            &config,
+                            repo.as_deref(),
+                            limit,
+                            Duration::from_secs(timeout),
+                            include_external,
+                        )?,
+                        format,
+                        &mut out,
+                    );
+                }
+                WorktreeCommand::Usage {
+                    worktree,
+                    repo,
+                    limit,
+                    timeout,
+                } => {
+                    ensure!(
+                        (1..=120).contains(&timeout),
+                        "Worktree usage timeout must be between 1 and 120 seconds"
+                    );
+                    return emit(
+                        &worktrees::usage_scoped(
+                            &config,
+                            worktree.as_deref(),
+                            repo.as_deref(),
+                            limit,
+                            Duration::from_secs(timeout),
+                        )?,
+                        format,
+                        &mut out,
+                    );
+                }
+                WorktreeCommand::Ps { limit } => {
+                    return emit(&worktree_ps(&config, limit)?, format, &mut out);
+                }
+                WorktreeCommand::Remove {
+                    selector,
+                    dry_run,
+                    force,
+                    run_hooks,
+                    allow_failed_archive_hook,
+                } => {
+                    return emit(
+                        &(if dry_run {
+                            worktrees::preview(
+                                &config,
+                                &selector,
+                                force,
+                                run_hooks,
+                                allow_failed_archive_hook,
+                            )
+                        } else {
+                            worktrees::remove(
+                                &config,
+                                &selector,
+                                force,
+                                run_hooks,
+                                allow_failed_archive_hook,
+                            )
+                        })?,
+                        format,
+                        &mut out,
+                    );
+                }
                 WorktreeCommand::List { project, repo } => {
                     args.push("list".into());
                     optional_arg(&mut args, "--repo", repo);
@@ -1535,9 +1988,16 @@ fn run() -> Result<()> {
                         &mut out,
                     );
                 }
-                TerminalCommand::Stop { terminal } => {
+                TerminalCommand::Stop {
+                    terminal,
+                    expected_incarnation,
+                } => {
                     return emit(
-                        &actions::stop_terminal(&config, &terminal, None)?,
+                        &actions::stop_terminal(
+                            &config,
+                            &terminal,
+                            expected_incarnation.as_deref(),
+                        )?,
                         format,
                         &mut out,
                     );
@@ -1562,16 +2022,20 @@ fn run() -> Result<()> {
                     terminal,
                     cursor,
                     limit,
+                    tail,
                 } => {
-                    let r = RpcClient::new(&config).call(
+                    let mut r = RpcClient::new(&config).call(
                         "terminal.read",
                         match cursor {
                             Some(cursor) => {
-                                json!({"terminal":terminal,"cursor":cursor,"limit":limit})
+                                json!({"terminal":terminal,"cursor":terminal_cursor(&cursor),"limit":limit})
                             }
                             None => json!({"terminal":terminal,"limit":limit}),
                         },
                     )?;
+                    if let Some(tail) = tail {
+                        terminal::limit_tail(&mut r, tail.get())?;
+                    }
                     return emit(&r, format, &mut out);
                 }
                 TerminalCommand::Follow {
@@ -1594,17 +2058,8 @@ fn run() -> Result<()> {
                 TerminalCommand::Focus { terminal } => {
                     args.extend(["switch".into(), "--terminal".into(), terminal])
                 }
-                TerminalCommand::Send {
-                    terminal,
-                    text,
-                    enter,
-                    interrupt,
-                } => {
-                    return emit(
-                        &send(&config, terminal, text, enter, interrupt)?,
-                        format,
-                        &mut out,
-                    );
+                TerminalCommand::Send { terminal, input } => {
+                    return emit(&send(&config, terminal, input)?, format, &mut out);
                 }
                 TerminalCommand::Create {
                     worktree,
@@ -1784,7 +2239,8 @@ fn run() -> Result<()> {
             let runtime = RpcClient::new(&config)
                 .with_timeout(Duration::from_secs(2))
                 .call("status.get", Value::Null);
-            let r = json!({"version":env!("CARGO_PKG_VERSION"),"dataDir":config.data_dir,"stateDir":config.state_dir,"profileDatabase":config.profile_db().ok(),"history":{"ok":history.is_ok(),"sessions":history.as_ref().ok().map(Vec::len),"error":history.err().map(|e|format!("{e:#}"))},"runtime":{"ok":runtime.is_ok(),"status":runtime.as_ref().ok().map(|s|json!({"appVersion":s["appVersion"],"runtimeId":s["runtimeId"],"graphStatus":s["graphStatus"]})),"error":runtime.err().map(|e|format!("{e:#}"))},"nativeStream":stream::status(&config),"orcaCli":config.orca_cli,"compatibility":"Orca 1.4.225; read-only SQLite plus authenticated local RPC"});
+            let capabilities = capabilities::inspect(&config, runtime.as_ref().ok());
+            let r = json!({"version":env!("CARGO_PKG_VERSION"),"dataDir":config.data_dir,"stateDir":config.state_dir,"profileDatabase":config.profile_db().ok(),"history":{"ok":history.is_ok(),"sessions":history.as_ref().ok().map(Vec::len),"error":history.err().map(|e|format!("{e:#}"))},"runtime":{"ok":runtime.is_ok(),"status":runtime.as_ref().ok().map(|s|json!({"appVersion":s["appVersion"],"runtimeId":s["runtimeId"],"graphStatus":s["graphStatus"]})),"error":runtime.err().map(|e|format!("{e:#}"))},"capabilities":capabilities,"nativeStream":stream::status(&config),"orcaCli":config.orca_cli,"compatibility":"Feature availability is reported by capabilities; version alone is not proof of support"});
             emit(&r, format, &mut out)
         }
         Command::Orca { args } => emit(&actions::orca(&config, &args)?, format, &mut out),
@@ -1867,7 +2323,32 @@ fn main() {
         }) {
             return;
         }
-        eprintln!("orca-bridge: {e:#}");
+        let json_errors = JSON_ERRORS.load(Ordering::Relaxed)
+            || std::env::args()
+                .take_while(|arg| arg != "--")
+                .any(|arg| arg == "--json-errors");
+        if let Some(parser) = e.downcast_ref::<clap::Error>() {
+            if !parser.use_stderr() {
+                let _ = parser.print();
+                return;
+            }
+            if json_errors {
+                let failure = errors::BridgeError::new(
+                    errors::ErrorCode::InvalidArguments,
+                    parser.to_string(),
+                    errors::Outcome::NotStarted,
+                );
+                let _ = line(&errors::envelope(&failure.into()), &mut io::stderr().lock());
+            } else {
+                let _ = parser.print();
+            }
+            std::process::exit(parser.exit_code());
+        }
+        if json_errors {
+            let _ = line(&errors::envelope(&e), &mut io::stderr().lock());
+        } else {
+            eprintln!("orca-bridge: {e:#}");
+        }
         std::process::exit(1);
     }
 }

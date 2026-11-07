@@ -1,4 +1,11 @@
-use crate::{config::Config, identity, model::Session, rpc::RpcClient};
+use crate::{
+    config::Config,
+    errors::{BridgeError, ErrorCode, Outcome, diagnostic},
+    identity,
+    model::Session,
+    process,
+    rpc::RpcClient,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, process::Command};
@@ -13,17 +20,39 @@ pub fn orca(config: &Config, args: &[String]) -> Result<Value> {
     if !args.iter().any(|arg| arg == "--json") {
         command.arg("--json");
     }
-    let output = command
-        .output()
-        .with_context(|| format!("Cannot execute {}", config.orca_cli.display()))?;
-    let value: Value =
-        serde_json::from_slice(&output.stdout).context("Orca CLI did not return JSON")?;
+    let (timeout, cap) = process::command_limits()?;
+    let output = process::output(&mut command, timeout, cap)?;
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        BridgeError::new(
+            ErrorCode::InvalidResponse,
+            "Orca CLI did not return JSON; request outcome is unknown; inspect before retrying",
+            Outcome::Unknown,
+        )
+    })?;
     if !output.status.success() || value["ok"] == false {
-        // CLI errors may include a recovery command; retain it for a deliberate retry.
-        bail!(
-            "Orca command failed: {}",
-            value.get("error").unwrap_or(&value)
-        );
+        let native = value.get("error").unwrap_or(&value);
+        let code = native["code"].as_str().unwrap_or("native_error");
+        let message = native["message"]
+            .as_str()
+            .unwrap_or("Native command exited unsuccessfully");
+        let error = BridgeError::new(
+            ErrorCode::NativeError,
+            format!(
+                "Orca command failed: {}: {}",
+                diagnostic(code),
+                diagnostic(message)
+            ),
+            Outcome::Unknown,
+        )
+        .with_native(&value);
+        let error = if args.first().is_some_and(|arg| arg == "terminal")
+            && args.get(1).is_some_and(|arg| arg == "send")
+        {
+            error.with_prompt_recovery(&value)
+        } else {
+            error
+        };
+        return Err(error.into());
     }
     Ok(value.get("result").cloned().unwrap_or(value))
 }
@@ -265,6 +294,49 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+
+    fn delegated_fixture(script: &str) -> (tempfile::TempDir, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fixture-cli");
+        std::fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = Config {
+            data_dir: dir.path().join("fixture-data"),
+            state_dir: dir.path().join("unused-state"),
+            orca_cli: executable,
+            profile_db_override: None,
+        };
+        (dir, config)
+    }
+
+    #[test]
+    fn delegated_native_errors_preserve_safe_retry_metadata_without_raw_payloads() {
+        let (_dir, config) = delegated_fixture(
+            "printf '%s\\n' '{\"ok\":false,\"operationId\":\"operation-fixture\",\"recovery\":{\"retryLaunchId\":\"launch-fixture\"},\"error\":{\"code\":\"fixture_rejected\",\"message\":\"Fixture rejected\",\"outcome\":\"unknown\",\"details\":{\"retryRequestId\":\"request-fixture\",\"authToken\":\"private token fixture\",\"params\":{\"prompt\":\"private prompt fixture\"}}}}'; exit 1",
+        );
+        let error = orca(&config, &["fixture".into()]).unwrap_err();
+        let envelope = crate::errors::envelope(&error);
+        assert_eq!(envelope["error"]["code"], "native_error");
+        assert_eq!(envelope["error"]["nativeCode"], "fixture_rejected");
+        assert_eq!(envelope["error"]["outcome"], "unknown");
+        assert_eq!(envelope["error"]["operationId"], "operation-fixture");
+        assert_eq!(envelope["error"]["retryRequestId"], "request-fixture");
+        assert_eq!(envelope["error"]["retryLaunchId"], "launch-fixture");
+        assert!(!envelope.to_string().contains("private"));
+        assert!(error.to_string().contains("Fixture rejected"));
+    }
+
+    #[test]
+    fn malformed_delegated_responses_do_not_echo_stdout_stderr_or_arguments() {
+        let (_dir, config) = delegated_fixture(
+            "printf 'private stdout fixture'; printf 'private stderr fixture' >&2; exit 1",
+        );
+        let error = orca(&config, &["private argument fixture".into()]).unwrap_err();
+        let envelope = crate::errors::envelope(&error);
+        assert_eq!(envelope["error"]["code"], "invalid_response");
+        assert_eq!(envelope["error"]["outcome"], "unknown");
+        assert!(!envelope.to_string().contains("private"));
+    }
 
     #[test]
     fn resume_preserves_provider_identity_and_account_preparation() {

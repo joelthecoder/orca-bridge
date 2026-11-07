@@ -43,6 +43,26 @@ with __import__('tempfile').TemporaryDirectory() as state:
     assert len(recorded) == 2 and recorded[0]['id'] < recorded[1]['id']
 usage = value('sessions', 'usage', sid)
 assert usage is not None
+new_checks = []
+text_session = next((row for row in sessions if row['agent'] in ('codex', 'claude')), None)
+if text_session:
+    messages = value('sessions', 'messages', text_session['id'], '--limit', '2')
+    assert messages['id'] == text_session['id'] and len(messages['messages']) <= 2
+    assert isinstance(messages['sourceTruncated'], bool) and isinstance(messages['limitTruncated'], bool)
+    assert messages['bytesRead'] <= 2097153
+    raw = run('sessions', 'transcript', text_session['id'], '--last', '2')
+    assert len([json.loads(line) for line in raw.splitlines()]) <= 2
+    new_checks += ['normalized-recent-messages', 'raw-transcript-suffix']
+terminals = value('terminals', 'list')['terminals']
+if terminals:
+    handle = terminals[0]['handle']
+    trimmed = value('terminals', 'read', handle, '--tail', '2')
+    assert len(trimmed['terminal']['tail']) <= 2 and trimmed['bridgeTail']['returned'] <= 2
+    cursor = trimmed['terminal']['nextCursor']
+    assert isinstance(cursor, str)
+    followed = run('terminals', 'follow', handle, '--cursor', cursor, '--count', '1', '--timeout', '1')
+    assert len([json.loads(line) for line in followed.splitlines()]) <= 1
+    new_checks += ['native-terminal-tail', 'native-opaque-cursor-follow']
 # A downstream close must finish successfully, without a broken-pipe diagnostic.
 process = subprocess.Popen([binary, 'watch', '--topics', 'sessions', '--interval-ms', '100'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 assert process.stdout.readline()
@@ -54,4 +74,4 @@ for _ in range(10):
     start = time.perf_counter()
     run('search', sessions[0]['agent'], '--limit', '10', '--json')
     measurements.append((time.perf_counter()-start)*1000)
-print(json.dumps({'ok': True, 'historySessions': health['history']['sessions'], 'nativePaired': health['nativeStream']['paired'], 'checks': ['history', 'fuzzy-search', 'JSONL-input-output', 'Alfred', 'RPC-pipeline', 'arbitrary-JSONL-filter', 'watch-record-replay', 'usage', 'cancellation'], 'searchProcessMs': {'min': round(min(measurements),2), 'median': round(statistics.median(measurements),2), 'max': round(max(measurements),2)}}, indent=2))
+print(json.dumps({'ok': True, 'historySessions': health['history']['sessions'], 'nativePaired': health['nativeStream']['paired'], 'checks': ['history', 'fuzzy-search', 'JSONL-input-output', 'Alfred', 'RPC-pipeline', 'arbitrary-JSONL-filter', 'watch-record-replay', 'usage', 'cancellation'] + new_checks, 'searchProcessMs': {'min': round(min(measurements),2), 'median': round(statistics.median(measurements),2), 'max': round(max(measurements),2)}}, indent=2))
